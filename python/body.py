@@ -1,14 +1,16 @@
-import cv2
-import numpy as np
-import util
+import json
 import math
-import time
-from scipy.ndimage.filters import gaussian_filter
+import os
+
+import cv2
 import matplotlib.pyplot as plt
-import matplotlib
-from model import bodypose_model
+import numpy as np
 import torch
-from torchvision import transforms
+import util
+from scipy.ndimage.filters import gaussian_filter
+
+from model import bodypose_model
+
 
 class Body(object):
     def __init__(self, model_path):
@@ -19,17 +21,97 @@ class Body(object):
         self.model.load_state_dict(model_dict)
         self.model.eval()
 
+    def inference_and_compute_loss(self, image, annotation):
+        """
+        Perform forward pass on image and compute loss
+
+        Inputs
+        ------
+        image: np.ndarray [H x W]
+
+        annotation: dict
+            Dictionary of MPII annotation containing keys such as 'joint_self', etc.
+        """
+        # Convert joint information to ground truth
+        people = util.get_openpose_annotation(annotation)
+        gt_heatmaps = util.get_gaussian_maps(people, image.shape)[:, :, :14]
+        gt_pafs = util.get_pafs(people, image.shape)
+
+        # Get masks
+        image_name = annotation['img_paths']
+        if not os.path.exists(os.path.join('masks', 'mask_' + image_name)):
+            print('Mask does not exist for {}'.format(image_name))
+            return None
+
+        mask = cv2.imread(os.path.join('masks', 'mask_' + image_name))
+        mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+        if mask.max() > 1:
+            mask = np.divide(mask, 255)
+
+        scale_search = [0.5, 1.0, 1.5, 2.0]
+        boxsize = 368
+        stride = 8
+        padValue = 128
+        thre1 = 0.1
+        thre2 = 0.05
+        multiplier = [x * boxsize / image.shape[0] for x in scale_search]
+        heatmap_avg = np.zeros((image.shape[0], image.shape[1], 16))
+        paf_avg = np.zeros((image.shape[0], image.shape[1], 28))
+
+        for m in range(len(multiplier)):
+            scale = multiplier[m]
+            imageToTest = cv2.resize(image, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            imageToTest_padded, pad = util.padRightDownCorner(imageToTest, stride, padValue)
+            im = np.transpose(np.float32(imageToTest_padded[:, :, :, np.newaxis]), (3, 2, 0, 1)) / 256 - 0.5
+            im = np.ascontiguousarray(im)
+
+            data = torch.from_numpy(im).float()
+            if torch.cuda.is_available():
+                data = data.cuda()
+            # data = data.permute([2, 0, 1]).unsqueeze(0).float()
+            with torch.no_grad():
+                Mconv7_stage6_L1, Mconv7_stage6_L2 = self.model(data)
+            Mconv7_stage6_L1 = Mconv7_stage6_L1.cpu().numpy()
+            Mconv7_stage6_L2 = Mconv7_stage6_L2.cpu().numpy()
+
+            # extract outputs, resize, and remove padding
+            heatmap = np.transpose(np.squeeze(Mconv7_stage6_L2), (1, 2, 0))  # output 1 is heatmaps
+            heatmap = cv2.resize(heatmap, (0, 0), fx=stride, fy=stride, interpolation=cv2.INTER_CUBIC)
+            heatmap = heatmap[:imageToTest_padded.shape[0] - pad[2], :imageToTest_padded.shape[1] - pad[3], :]
+            heatmap = cv2.resize(heatmap, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_CUBIC)
+
+            # paf = np.transpose(np.squeeze(net.blobs[output_blobs.keys()[0]].data), (1, 2, 0))  # output 0 is PAFs
+            paf = np.transpose(np.squeeze(Mconv7_stage6_L1), (1, 2, 0))  # output 0 is PAFs
+            paf = cv2.resize(paf, (0, 0), fx=stride, fy=stride, interpolation=cv2.INTER_CUBIC)
+            paf = paf[:imageToTest_padded.shape[0] - pad[2], :imageToTest_padded.shape[1] - pad[3], :]
+            paf = cv2.resize(paf, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_CUBIC)
+
+            heatmap_avg += heatmap_avg + heatmap / len(multiplier)
+            paf_avg += + paf / len(multiplier)
+
+        # Resize outputs to the ground truth size
+        output_heatmaps = cv2.resize(heatmap_avg[:, :, :14], tuple(reversed(gt_heatmaps.shape[:2])))
+        output_pafs = cv2.resize(paf_avg, tuple(reversed(gt_heatmaps.shape[:2])))
+
+        # Apply mask and compute loss
+        mask = cv2.resize(mask, (tuple(reversed(gt_heatmaps.shape[:2]))))
+        mask = np.expand_dims(mask, axis=2)
+        heatmap_sse = np.multiply(mask, (gt_heatmaps - output_heatmaps) ** 2)
+        pafs_sse = np.multiply(mask, (gt_pafs - output_pafs) ** 2)
+        loss = np.sum(heatmap_sse) + np.sum(pafs_sse)
+
+        return loss
+
     def __call__(self, oriImg):
-        # scale_search = [0.5, 1.0, 1.5, 2.0]
-        scale_search = [0.5]
+        scale_search = [0.5, 1.0, 1.5, 2.0]
         boxsize = 368
         stride = 8
         padValue = 128
         thre1 = 0.1
         thre2 = 0.05
         multiplier = [x * boxsize / oriImg.shape[0] for x in scale_search]
-        heatmap_avg = np.zeros((oriImg.shape[0], oriImg.shape[1], 19))
-        paf_avg = np.zeros((oriImg.shape[0], oriImg.shape[1], 38))
+        heatmap_avg = np.zeros((oriImg.shape[0], oriImg.shape[1], 16))
+        paf_avg = np.zeros((oriImg.shape[0], oriImg.shape[1], 28))
 
         for m in range(len(multiplier)):
             scale = multiplier[m]
@@ -48,7 +130,6 @@ class Body(object):
             Mconv7_stage6_L2 = Mconv7_stage6_L2.cpu().numpy()
 
             # extract outputs, resize, and remove padding
-            # heatmap = np.transpose(np.squeeze(net.blobs[output_blobs.keys()[1]].data), (1, 2, 0))  # output 1 is heatmaps
             heatmap = np.transpose(np.squeeze(Mconv7_stage6_L2), (1, 2, 0))  # output 1 is heatmaps
             heatmap = cv2.resize(heatmap, (0, 0), fx=stride, fy=stride, interpolation=cv2.INTER_CUBIC)
             heatmap = heatmap[:imageToTest_padded.shape[0] - pad[2], :imageToTest_padded.shape[1] - pad[3], :]
@@ -65,8 +146,9 @@ class Body(object):
 
         all_peaks = []
         peak_counter = 0
+        num_parts = heatmap_avg.shape[-1]
 
-        for part in range(18):
+        for part in range(num_parts - 1):
             map_ori = heatmap_avg[:, :, part]
             one_heatmap = gaussian_filter(map_ori, sigma=3)
 
@@ -89,21 +171,19 @@ class Body(object):
             all_peaks.append(peaks_with_score_and_id)
             peak_counter += len(peaks)
 
-        # find connection in the specified sequence, center 29 is in the position 15
-        limbSeq = [[2, 3], [2, 6], [3, 4], [4, 5], [6, 7], [7, 8], [2, 9], [9, 10], \
-                   [10, 11], [2, 12], [12, 13], [13, 14], [2, 1], [1, 15], [15, 17], \
-                   [1, 16], [16, 18], [3, 17], [6, 18]]
+        # find connection in the specified sequence
+        limbSeq = [[1, 2], [2, 3], [3, 4], [4, 5], [2, 6], [6, 7], [7, 8], [2, 15],
+                   [15, 12], [12, 13], [13, 14], [15, 9], [9, 10], [10, 11]]
         # the middle joints heatmap correpondence
-        mapIdx = [[31, 32], [39, 40], [33, 34], [35, 36], [41, 42], [43, 44], [19, 20], [21, 22], \
-                  [23, 24], [25, 26], [27, 28], [29, 30], [47, 48], [49, 50], [53, 54], [51, 52], \
-                  [55, 56], [37, 38], [45, 46]]
+        mapIdx = [[16, 17], [18, 19], [20, 21], [22, 23], [24, 25], [26, 27], [28, 29], [30, 31],
+                  [38, 39], [40, 41], [42, 43], [32, 33], [34, 35], [36, 37]]
 
         connection_all = []
         special_k = []
         mid_num = 10
 
         for k in range(len(mapIdx)):
-            score_mid = paf_avg[:, :, [x - 19 for x in mapIdx[k]]]
+            score_mid = paf_avg[:, :, [x - 16 for x in mapIdx[k]]]
             candA = all_peaks[limbSeq[k][0] - 1]
             candB = all_peaks[limbSeq[k][1] - 1]
             nA = len(candA)
@@ -205,12 +285,24 @@ class Body(object):
         # candidate: x, y, score, id
         return candidate, subset
 
-if __name__ == "__main__":
-    body_estimation = Body('../model/body_pose_model.pth')
 
-    test_image = '../images/ski.jpg'
-    oriImg = cv2.imread(test_image)  # B,G,R order
-    candidate, subset = body_estimation(oriImg)
-    canvas = util.draw_bodypose(oriImg, candidate, subset)
-    plt.imshow(canvas[:, :, [2, 1, 0]])
-    plt.show()
+if __name__ == "__main__":
+    body_estimation = Body('../model/pose_iter_146000.caffemodel.pt')
+    image = cv2.imread('../images/000003072.jpg')
+
+    # Test loss computation
+    with open('mpii_annotations.json', 'rb') as f:
+        annotations = json.load(f)
+    jpg_name = '000003072.jpg'
+    annotation = [x for x in annotations if x['img_paths'] == jpg_name][0]
+    loss = body_estimation.inference_and_compute_loss(image, annotation)
+    print('sample computed loss: {}'.format(loss))
+
+    # Test model inference by displaying joint predictions
+    for test_image in ['../images/000003072.jpg', '../images/ski.jpg', '../images/person.jpg',
+                       '../images/mpii_sample.jpg']:
+        oriImg = cv2.imread(test_image) # B,G,R order
+        candidate, subset = body_estimation(oriImg)
+        canvas = util.draw_bodypose(oriImg, candidate, subset)
+        plt.imshow(canvas[:, :, [2, 1, 0]])
+        plt.show()
